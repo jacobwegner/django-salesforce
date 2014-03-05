@@ -6,6 +6,7 @@
 #
 
 import datetime
+import decimal
 import pytz
 
 from django.conf import settings
@@ -15,6 +16,7 @@ import django
 
 from salesforce.testrunner.example.models import (Account, Contact, Lead, User,
 		BusinessHours, ChargentOrder, CronTrigger,
+		Product, Pricebook, PricebookEntry,
 		GeneralCustomModel, test_custom_db_table, test_custom_db_column)
 
 import logging
@@ -92,12 +94,21 @@ class BasicSOQLTest(TestCase):
 		"""
 		contacts = Contact.objects.all()[0:2]
 		self.assertEqual(len(contacts), 2)
-	
+
+	def test_exclude_query_construction(self):
+		"""
+		Test that exclude query construction returns valid SOQL.
+		"""
+		contacts = Contact.objects.filter(FirstName__isnull=False).exclude(Email="steve@apple.com", LastName="Wozniak").exclude(LastName="smith")
+		number_of_contacts = contacts.count()
+		self.assertIsInstance(number_of_contacts, int)
+
 	def test_foreign_key(self):
 		"""
 		Verify that the owner of an Contact is the currently logged admin.
 		"""
-		contact = Contact.objects.all()[0]
+		current_sf_user = User.objects.get(Username=current_user)
+		contact = Contact.objects.filter(Owner=current_sf_user)[0]
 		user = contact.Owner
 		# This user can be e.g. 'admins@freelancersunion.org.prod001'.
 		self.assertEqual(user.Username, current_user)
@@ -244,6 +255,27 @@ class BasicSOQLTest(TestCase):
 		test_lead.save()
 		self.assertEqual(refresh(test_lead).FirstName, 'Tested')
 
+	def test_decimal_precision(self):
+		"""
+		Ensure that the precision on a DecimalField of a record saved to
+		or retrieved from SalesForce is equal.
+		"""
+		product = Product(Name="Test Product")
+		product.save()
+
+		# The price for a product must be set in the standard price book.
+		# http://www.salesforce.com/us/developer/docs/api/Content/sforce_api_objects_pricebookentry.htm
+		pricebook = Pricebook.objects.get(Name="Standard Price Book")
+		saved_pricebook_entry = PricebookEntry(Product2Id=product, Pricebook2Id=pricebook, UnitPrice=decimal.Decimal('1234.56'), UseStandardPrice=False)
+		saved_pricebook_entry.save()
+		retrieved_pricebook_entry = PricebookEntry.objects.get(pk=saved_pricebook_entry.pk)
+
+		try:
+			self.assertEqual(saved_pricebook_entry.UnitPrice, retrieved_pricebook_entry.UnitPrice)
+		finally:
+			retrieved_pricebook_entry.delete()
+			product.delete()
+
 	def test_custom_objects(self):
 		"""
 		Make sure custom objects work.
@@ -276,8 +308,10 @@ class BasicSOQLTest(TestCase):
 		"""
 		Verify that a field with milisecond resolution is readable.
 		"""
-		trigger = CronTrigger.objects.all()[0]
-		self.assertTrue(isinstance(trigger.PreviousFireTime, datetime.datetime))
+		triggers = CronTrigger.objects.all()
+		if not triggers:
+			self.skipTest("No object with milisecond resolution found.")
+		self.assertTrue(isinstance(triggers[0].PreviousFireTime, datetime.datetime))
 		# The reliability of this is only 99.9%, therefore it is commented out.
 		#self.assertNotEqual(trigger.PreviousFireTime.microsecond, 0)
 
@@ -334,3 +368,32 @@ class BasicSOQLTest(TestCase):
 			self.skipTest('Django 1.3 has no bulk operations.')
 		objects = [Contact(LastName='sf_test a'), Contact(LastName='sf_test b')]
 		self.assertRaises(AssertionError, Contact.objects.bulk_create, objects)
+
+	def test_escape_single_quote(self):
+		"""
+		Test that single quotes in strings used in filtering a QuerySet
+		are escaped properly.
+		"""
+		account_name = '''Dr. Evil's Giant "Laser", LLC'''
+		account = Account(Name=account_name)
+		account.save()
+		try:
+			self.assertTrue(Account.objects.filter(Name=account_name).exists())
+		finally:
+			account.delete()
+
+	def test_escape_single_quote_in_raw_query(self):
+		"""
+		Test that manual escaping within a raw query is not double escaped.
+		"""
+		account_name = '''Dr. Evil's Giant "Laser", LLC'''
+		account = Account(Name=account_name)
+		account.save()
+
+		manually_escaped = '''Dr. Evil\\'s Giant "Laser", LLC'''
+		try:
+			retrieved_account = Account.objects.raw(
+				"SELECT Id, Name FROM Account WHERE Name = '{}'".format(manually_escaped))[0]
+			self.assertEqual(account_name, retrieved_account.Name)
+		finally:
+			account.delete()
